@@ -77,10 +77,10 @@ class SchedulerPPMixin:
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
-                next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
+                next_first_rank_mb_id = (mb_id + self.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
                 with torch.profiler.record_function("recv_requests"):
-                    recv_reqs = self.request_receiver.recv_requests()
+                    recv_reqs = self.recv_requests()
                     self.process_input_requests(recv_reqs)
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
@@ -205,7 +205,7 @@ class SchedulerPPMixin:
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
-                next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
+                next_first_rank_mb_id = (mb_id + self.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
 
                 next_pp_outputs = None
@@ -214,7 +214,7 @@ class SchedulerPPMixin:
                 d2h_event = None
                 next_batch_result = None
 
-                recv_reqs = self.request_receiver.recv_requests()
+                recv_reqs = self.recv_requests()
                 self.process_input_requests(recv_reqs)
 
                 if not self.pp_group.is_last_rank:
@@ -230,7 +230,7 @@ class SchedulerPPMixin:
 
                 self.process_prefill_chunk()
                 batch = self.get_new_batch_prefill()
-                batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
+                batch = self.maybe_prepare_mlp_sync_batch(batch)
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
 
@@ -350,7 +350,7 @@ class SchedulerPPMixin:
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
-                next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
+                next_first_rank_mb_id = (mb_id + self.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
 
                 next_pp_outputs = None
@@ -360,7 +360,7 @@ class SchedulerPPMixin:
                 d2h_event = None
                 next_batch_result = None
 
-                recv_reqs = self.request_receiver.recv_requests()
+                recv_reqs = self.recv_requests()
                 self.process_input_requests(recv_reqs)
 
                 if not self.pp_group.is_last_rank:
@@ -520,7 +520,7 @@ class SchedulerPPMixin:
                 self.on_idle()
 
     def init_pp_loop_state(self: Scheduler):
-        self.pp_loop_size: int = self.ps.pp_size + self.server_args.pp_async_batch_depth
+        self.pp_loop_size: int = self.pp_size + self.server_args.pp_async_batch_depth
         # In CP mode, attention weights are duplicated, eliminating the need for the attention TP all-gather operation.
         self.require_attn_tp_allgather = (
             not self.server_args.enable_nsa_prefill_context_parallel
@@ -613,13 +613,9 @@ class SchedulerPPMixin:
                     batch.global_num_tokens = global_num_tokens
                     batch.global_num_tokens_for_logprob = global_num_tokens
 
-                hs = (
-                    getattr(model_config, "hc_hidden_size", None)
-                    or model_config.hidden_size
-                )
                 proxy_tensors = {
                     "hidden_states": torch.zeros(
-                        (current_seq_len, hs),
+                        (current_seq_len, model_config.hidden_size),
                         dtype=model_config.dtype,
                         device=self.device,
                     ),
@@ -639,8 +635,9 @@ class SchedulerPPMixin:
 
                 start = time.perf_counter()
                 batch.prepare_for_extend()
+                model_worker_batch = batch.get_model_worker_batch()
 
-                forward_batch = ForwardBatch.init_new(batch, model_runner)
+                forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
                 set_is_extend_in_batch(batch.forward_mode.is_extend())
 
                 _ = model_runner.forward(
@@ -668,7 +665,7 @@ class SchedulerPPMixin:
                 f"seq_lens={seq_lens}, latencies_ms={latencies}"
             )
 
-            if self.ps.attn_tp_size > 1:
+            if self.attn_tp_size > 1:
                 data_to_sync_tp = [seq_lens, latencies]
                 data_to_sync_tp = broadcast_pyobj(
                     data_to_sync_tp,
@@ -678,7 +675,7 @@ class SchedulerPPMixin:
                 )
                 seq_lens, latencies = data_to_sync_tp
 
-            if self.ps.attn_cp_size > 1:
+            if self.attn_cp_size > 1:
                 data_to_sync_tp = [seq_lens, latencies]
                 data_to_sync_tp = broadcast_pyobj(
                     data_to_sync_tp,
@@ -699,7 +696,7 @@ class SchedulerPPMixin:
         self.length_predictor.set_target_latency(self.chunked_prefill_size)
         self.length_predictor.is_ready = True
         logger.info(
-            f"[PP Dynamic Chunk] [PP{self.ps.pp_rank}] Predictor ready (quadratic). "
+            f"[PP Dynamic Chunk] [PP{self.pp_rank}] Predictor ready (quadratic). "
             f"Target latency: {self.length_predictor.target_latency:.2f}ms"
         )
 
@@ -720,7 +717,7 @@ class SchedulerPPMixin:
         ):
             return None
 
-        max_chunk_size = self.max_prefill_tokens
+        max_chunk_size = getattr(self, "max_prefill_tokens", None)
         predicted_size = self.length_predictor.predict_next_chunk_size(
             history_len=history_len,
             base_chunk_size=self.chunked_prefill_size,
@@ -731,7 +728,7 @@ class SchedulerPPMixin:
 
         if predicted_size is not None:
             logger.debug(
-                f"[PP Dynamic Chunk] [PP{self.ps.pp_rank}] Predicted chunk size: "
+                f"[PP Dynamic Chunk] [PP{self.pp_rank}] Predicted chunk size: "
                 f"{predicted_size} (history_len={history_len})"
             )
 
@@ -745,7 +742,8 @@ class SchedulerPPMixin:
             (
                 good_consensus_bootstrapped_rids,
                 bad_consensus_bootstrapped_rids,
-            ) = bootstrapped_rids
+                pp_prefix_len_caps,
+            ) = self._pp_pd_unpack_bootstrapped_info(bootstrapped_rids)
             good_reqs, failed_reqs = (
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
                     return_failed_reqs=True,
@@ -753,9 +751,65 @@ class SchedulerPPMixin:
                     + bad_consensus_bootstrapped_rids,
                 )
             )
+            for req in good_reqs:
+                req.pp_prefix_len_cap = pp_prefix_len_caps.get(req.rid)
             self.waiting_queue.extend(good_reqs)
-            return [[req.rid for req in good_reqs], [req.rid for req in failed_reqs]]
+            return [
+                [req.rid for req in good_reqs],
+                [req.rid for req in failed_reqs],
+                {
+                    req.rid: req.pp_prefix_len_cap
+                    for req in good_reqs
+                    if req.pp_prefix_len_cap is not None
+                },
+            ]
         return None
+
+    def _pp_pd_unpack_bootstrapped_info(self: Scheduler, bootstrapped_info):
+        if len(bootstrapped_info) == 2:
+            good_bootstrapped_rids, bad_bootstrapped_rids = bootstrapped_info
+            pp_prefix_len_caps = {}
+        else:
+            (
+                good_bootstrapped_rids,
+                bad_bootstrapped_rids,
+                pp_prefix_len_caps,
+            ) = bootstrapped_info
+            pp_prefix_len_caps = pp_prefix_len_caps or {}
+        return good_bootstrapped_rids, bad_bootstrapped_rids, pp_prefix_len_caps
+
+    def _pp_pd_get_local_prefix_len_caps(self: Scheduler, rids: List[str]):
+        if not self.enable_hierarchical_cache:
+            return {}
+
+        rid_set = set(rids)
+        prefix_len_caps = {}
+        for req in self.disagg_prefill_bootstrap_queue.queue:
+            if req.rid not in rid_set:
+                continue
+            req.init_next_round_input(self.tree_cache)
+            prefix_len_caps[req.rid] = len(req.prefix_indices) + req.host_hit_length
+        return prefix_len_caps
+
+    def _pp_pd_merge_prefix_len_caps(
+        self: Scheduler,
+        rids: List[str],
+        prev_prefix_len_caps: Dict[str, int],
+        curr_prefix_len_caps: Dict[str, int],
+    ):
+        prefix_len_caps = {}
+        for rid in rids:
+            prev_len = prev_prefix_len_caps.get(rid)
+            curr_len = curr_prefix_len_caps.get(rid)
+            if prev_len is None:
+                cap = curr_len
+            elif curr_len is None:
+                cap = prev_len
+            else:
+                cap = min(prev_len, curr_len)
+            if cap is not None:
+                prefix_len_caps[rid] = cap
+        return prefix_len_caps
 
     def _pp_pd_get_bootstrapped_ids(self: Scheduler):
         # communicate pre-consensus bootstrapp reqs
@@ -767,12 +821,17 @@ class SchedulerPPMixin:
                 [KVPoll.WaitingForInput],
                 [KVPoll.Failed],
             )
+            pp_prefix_len_caps = self._pp_pd_get_local_prefix_len_caps(
+                good_bootstrapped_rids
+            )
         else:
             # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
             prev_bootstrapped_rids = self._pp_recv_pyobj_from_prev_stage()
-            prev_good_bootstrapped_rids, prev_bad_bootstrapped_rids = (
-                prev_bootstrapped_rids
-            )
+            (
+                prev_good_bootstrapped_rids,
+                prev_bad_bootstrapped_rids,
+                prev_prefix_len_caps,
+            ) = self._pp_pd_unpack_bootstrapped_info(prev_bootstrapped_rids)
             curr_good_bootstrapped_rids, curr_bad_bootstrapped_rids = self.get_rids(
                 self.disagg_prefill_bootstrap_queue.queue,
                 True,
@@ -785,7 +844,15 @@ class SchedulerPPMixin:
             bad_bootstrapped_rids = list(
                 set(prev_bad_bootstrapped_rids) | set(curr_bad_bootstrapped_rids)
             )
-        return [good_bootstrapped_rids, bad_bootstrapped_rids]
+            curr_prefix_len_caps = self._pp_pd_get_local_prefix_len_caps(
+                good_bootstrapped_rids
+            )
+            pp_prefix_len_caps = self._pp_pd_merge_prefix_len_caps(
+                good_bootstrapped_rids,
+                prev_prefix_len_caps,
+                curr_prefix_len_caps,
+            )
+        return [good_bootstrapped_rids, bad_bootstrapped_rids, pp_prefix_len_caps]
 
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
         # get the current stage transfer success
@@ -889,32 +956,32 @@ class SchedulerPPMixin:
 
     def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
         p2p_work = []
-        if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
-            dp_offset = self.ps.attn_dp_rank * self.ps.attn_tp_size
+        if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
+            dp_offset = self.attn_dp_rank * self.attn_tp_size
             p2p_work = point_to_point_pyobj(
                 data,
-                self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                self.pp_rank * self.tp_size + dp_offset,
                 self.world_group.cpu_group,
-                self.ps.pp_rank * self.ps.tp_size + dp_offset,
-                ((self.ps.pp_rank + 1) % self.ps.pp_size) * self.ps.tp_size + dp_offset,
+                self.pp_rank * self.tp_size + dp_offset,
+                ((self.pp_rank + 1) % self.pp_size) * self.tp_size + dp_offset,
                 async_send=async_send,
             )
         return p2p_work
 
     def _pp_recv_pyobj_from_prev_stage(self: Scheduler):
-        if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
-            dp_offset = self.ps.attn_dp_rank * self.ps.attn_tp_size
+        if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
+            dp_offset = self.attn_dp_rank * self.attn_tp_size
             data = point_to_point_pyobj(
                 [],
-                self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                self.pp_rank * self.tp_size + dp_offset,
                 self.world_group.cpu_group,
-                ((self.ps.pp_rank - 1) % self.ps.pp_size) * self.ps.tp_size + dp_offset,
-                self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                ((self.pp_rank - 1) % self.pp_size) * self.tp_size + dp_offset,
+                self.pp_rank * self.tp_size + dp_offset,
             )
         else:
             data = None
 
-        if self.ps.attn_tp_size > 1:
+        if self.attn_tp_size > 1:
             data = broadcast_pyobj(
                 data,
                 self.attn_tp_group.rank,
@@ -922,7 +989,7 @@ class SchedulerPPMixin:
                 src=self.attn_tp_group.ranks[0],
             )
 
-        if self.ps.attn_cp_size > 1:
+        if self.attn_cp_size > 1:
             data = broadcast_pyobj(
                 data,
                 self.attn_cp_group.rank,
@@ -1123,7 +1190,7 @@ class SchedulerPPMixin:
 
         # CUDA: send first
         # XPU: even ranks send first, odd ranks recv first.
-        send_first = (not is_xpu()) or ((self.ps.pp_rank % 2) == 0)
+        send_first = (not is_xpu()) or ((self.pp_rank % 2) == 0)
 
         def _do_send():
             return self._pp_send_output_to_next_stage(
